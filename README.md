@@ -1,183 +1,97 @@
-# Fine-tuning и запуск языковых моделей с LoRA
+# Fine-tuning и запуск моделей с LoRA
 
-Этот проект содержит код для дообучения языковых моделей с использованием LoRA (Low-Rank Adaptation) и их запуска для интерактивного общения.
+Проект содержит:
+- скрипт дообучения модели LoRA: `fine_tuning/train.py`
+- скрипт запуска чата: `inference/chat.py`
+- пример датасета: `example_dataset.json`
 
-## Структура проекта
+## Структура
 
-```
+```text
 .
-├── fine_tuning/          # Код для дообучения модели
-│   ├── train.py         # Основной скрипт обучения
-│   └── README.md        # Документация по обучению
-├── inference/           # Код для запуска модели
-│   ├── chat.py         # Скрипт для интерактивного чата
-│   └── README.md       # Документация по запуску
-├── requirements.txt     # Зависимости Python
-└── README.md           # Этот файл
+├── fine_tuning/
+│   ├── train.py
+│   └── README.md
+├── inference/
+│   ├── chat.py
+│   └── README.md
+├── example_dataset.json
+├── requirements.txt
+└── README.md
 ```
 
 ## Установка
 
-1. Установите зависимости:
+Если вы работаете в уже созданном `venv`:
 
-```bash
-pip install -r requirements.txt
+```powershell
+python -m pip install --upgrade pip
+python -m pip install -r .\requirements.txt
 ```
 
-2. Убедитесь, что у вас установлен CUDA (для GPU ускорения):
+Для RTX 5060 можно поставить PyTorch с CUDA 12.8:
 
-```bash
-# Проверка CUDA
-python -c "import torch; print(torch.cuda.is_available())"
+```powershell
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
-**⚠ ВАЖНО для RTX 5060:** Если `torch.cuda.is_available()` возвращает `False`, установите PyTorch с CUDA поддержкой:
+Проверка:
 
-```bash
-# Удалите текущий PyTorch
-pip uninstall torch torchvision torchaudio
-
-# Установите PyTorch с CUDA 12.1 (для RTX 5060)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```powershell
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 ```
 
-Подробные инструкции в файле `INSTALL_CUDA.md`
+## Датасет
 
-## Скачивание модели
+В репозитории уже есть готовый пример: `example_dataset.json`.
 
-### Рекомендуемые легкие модели для быстрого тестирования:
-
-#### 1. **Microsoft DialoGPT-small** (117M параметров) - Рекомендуется для начала
-```bash
-# Модель автоматически скачается при первом запуске
-# Или можно скачать вручную:
-python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; AutoModelForCausalLM.from_pretrained('microsoft/DialoGPT-small'); AutoTokenizer.from_pretrained('microsoft/DialoGPT-small')"
-```
-
-#### 2. **GPT-2 small** (124M параметров)
-```bash
-python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; AutoModelForCausalLM.from_pretrained('gpt2'); AutoTokenizer.from_pretrained('gpt2')"
-```
-
-#### 3. **TinyLlama-1.1B** (1.1B параметров) - Больше, но все еще быстро
-```bash
-python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; AutoModelForCausalLM.from_pretrained('TinyLlama/TinyLlama-1.1B-Chat-v1.0'); AutoTokenizer.from_pretrained('TinyLlama/TinyLlama-1.1B-Chat-v1.0')"
-```
-
-#### 4. **DistilGPT-2** (82M параметров) - Самый легкий
-```bash
-python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; AutoModelForCausalLM.from_pretrained('distilgpt2'); AutoTokenizer.from_pretrained('distilgpt2')"
-```
-
-### Автоматическое скачивание
-
-Модели автоматически скачиваются при первом запуске скриптов обучения или инференса. Они сохраняются в кэш HuggingFace (обычно `~/.cache/huggingface/`).
-
-### Ручное скачивание через Python
-
-Создайте файл `download_model.py`:
-
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-model_name = "microsoft/DialoGPT-small"  # Замените на нужную модель
-
-print(f"Скачивание модели {model_name}...")
-model = AutoModelForCausalLM.from_pretrained(model_name)
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-print("Модель успешно скачана!")
-```
-
-Запустите:
-```bash
-python download_model.py
-```
+Поддерживаются `.json` и `.jsonl` в форматах:
+- `{"text": "..."}`
+- `{"instruction": "...", "output": "..."}`
+- `{"prompt": "...", "completion": "..."}`
+- `{"input": "...", "output": "..."}`
 
 ## Быстрый старт
 
-### 1. Подготовка датасета
+### CPU
 
-Создайте файл с вашим датасетом в формате JSON или JSONL. Пример (`dataset.json`):
-
-```json
-[
-    {
-        "text": "Привет! Как дела?"
-    },
-    {
-        "instruction": "Расскажи анекдот",
-        "output": "Почему программисты не любят природу? Там слишком много багов!"
-    }
-]
+```powershell
+python .\fine_tuning\train.py --model_name "microsoft/DialoGPT-small" --dataset_path ".\example_dataset.json" --output_dir ".\fine_tuning\lora_model_cpu" --num_train_epochs 3 --per_device_train_batch_size 1 --gradient_accumulation_steps 1 --device cpu
 ```
 
-### 2. Дообучение модели
+### GPU
 
-```bash
-cd fine_tuning
-python train.py \
-    --model_name "microsoft/DialoGPT-small" \
-    --dataset_path "../dataset.json" \
-    --output_dir "./lora_model" \
-    --use_4bit \
-    --num_train_epochs 3
+```powershell
+python .\fine_tuning\train.py --model_name "microsoft/DialoGPT-small" --dataset_path ".\example_dataset.json" --output_dir ".\fine_tuning\lora_model_gpu" --use_4bit --num_train_epochs 3 --device cuda
 ```
 
-### 3. Запуск модели для общения
+Примечания:
+- на CPU не используйте `--use_4bit`
+- на слабом железе уменьшайте `--per_device_train_batch_size`
+- базовая модель скачивается автоматически при первом запуске
 
-```bash
-cd inference
-python chat.py \
-    --base_model "microsoft/DialoGPT-small" \
-    --lora_model "../fine_tuning/lora_model"
+## Проверочный запуск на маленькой модели
+
+```powershell
+python .\fine_tuning\train.py --model_name "sshleifer/tiny-gpt2" --dataset_path ".\example_dataset.json" --output_dir ".\fine_tuning\tmp_cpu_test" --num_train_epochs 1 --per_device_train_batch_size 1 --gradient_accumulation_steps 1 --max_length 32 --device cpu
 ```
 
-## Рекомендации по выбору модели
+## Запуск чата после обучения
 
-### Для быстрого тестирования (мало памяти, быстрое обучение):
-- **DistilGPT-2** (82M) - самый легкий
-- **DialoGPT-small** (117M) - хороший баланс
-- **GPT-2 small** (124M) - стандартный выбор
+```powershell
+python .\inference\chat.py --base_model "microsoft/DialoGPT-small" --lora_model ".\fine_tuning\lora_model_cpu"
+```
 
-### Для лучшего качества (больше памяти, дольше обучение):
-- **TinyLlama-1.1B** (1.1B) - хорошее качество при разумном размере
-- **GPT-2 medium** (355M)
-- **GPT-2 large** (774M)
+## Что важно знать
 
-### Для русского языка:
-- **rugpt3small_based_on_gpt2** - русскоязычная модель на базе GPT-2
-- **ai-forever/rugpt3small_based_on_gpt2**
+- `fine_tuning/train.py` теперь поддерживает `--device auto|cpu|cuda`
+- если указать `--device cpu`, скрипт автоматически отключит 4-bit quantization
+- на Windows/Powershell убраны проблемные Unicode-символы из логов
 
-## Требования к системе
+## Полезные модели для старта
 
-- **Минимум**: 4GB RAM, без GPU (будет медленно)
-- **Рекомендуется**: 8GB+ RAM, GPU с 4GB+ VRAM
-- **Для больших моделей**: 16GB+ RAM, GPU с 8GB+ VRAM
-
-## Полезные ссылки
-
-- [HuggingFace Models](https://huggingface.co/models) - каталог моделей
-- [LoRA Paper](https://arxiv.org/abs/2106.09685) - оригинальная статья о LoRA
-- [PEFT Documentation](https://huggingface.co/docs/peft) - документация по PEFT/LoRA
-
-## Решение проблем
-
-### Нехватка памяти GPU:
-- Используйте `--use_4bit` при обучении
-- Уменьшите `--per_device_train_batch_size`
-- Увеличьте `--gradient_accumulation_steps`
-
-### Медленная генерация:
-- Уменьшите `--max_length`
-- Используйте GPU вместо CPU
-- Выберите более легкую модель
-
-### Ошибки при загрузке модели:
-- Проверьте подключение к интернету
-- Убедитесь, что имя модели корректно
-- Попробуйте другую модель
-
-## Лицензия
-
-Этот код предоставляется "как есть" для образовательных целей.
+- `microsoft/DialoGPT-small`
+- `distilgpt2`
+- `gpt2`
+- `sshleifer/tiny-gpt2` для smoke-test
 

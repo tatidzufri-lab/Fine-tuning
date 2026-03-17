@@ -1,101 +1,51 @@
 # Fine-tuning модели с LoRA
 
-Эта папка содержит код для дообучения модели с использованием LoRA (Low-Rank Adaptation).
+`train.py` обучает LoRA-адаптер поверх базовой модели Hugging Face.
 
-## Оптимизация для RTX 5060
+## Что поддерживается
 
-Код автоматически определяет RTX 5060 и оптимизирует настройки:
-- ✅ FP16 включен для ускорения
-- ✅ Gradient checkpointing для экономии памяти (8GB VRAM)
-- ✅ Оптимизированные настройки DataLoader
-- ✅ Рекомендуемый batch_size: 2-4 для моделей ~120M параметров
+- устройство: `--device auto|cpu|cuda`
+- датасеты: `.json` и `.jsonl`
+- форматы примеров:
+  - `text`
+  - `instruction/output`
+  - `prompt/completion`
+  - `input/output`
 
-## Использование
+## Быстрый запуск
 
-### Базовый запуск:
+### CPU
 
-```bash
-python train.py \
-    --model_name "microsoft/DialoGPT-small" \
-    --dataset_path "your_dataset.json" \
-    --output_dir "./lora_model"
+```powershell
+python .\fine_tuning\train.py --model_name "microsoft/DialoGPT-small" --dataset_path ".\example_dataset.json" --output_dir ".\fine_tuning\lora_model_cpu" --num_train_epochs 3 --per_device_train_batch_size 1 --gradient_accumulation_steps 1 --device cpu
 ```
 
-### С дополнительными параметрами:
+### GPU
 
-```bash
-python train.py \
-    --model_name "microsoft/DialoGPT-small" \
-    --dataset_path "your_dataset.json" \
-    --output_dir "./lora_model" \
-    --num_train_epochs 5 \
-    --per_device_train_batch_size 4 \
-    --learning_rate 2e-4 \
-    --use_4bit \
-    --lora_r 16 \
-    --lora_alpha 32
+```powershell
+python .\fine_tuning\train.py --model_name "microsoft/DialoGPT-small" --dataset_path ".\example_dataset.json" --output_dir ".\fine_tuning\lora_model_gpu" --use_4bit --num_train_epochs 3 --device cuda
 ```
 
-## Параметры
+## Полезные параметры
 
-- `--model_name`: Имя модели с HuggingFace (обязательно)
-- `--dataset_path`: Путь к датасету в формате .json или .jsonl (обязательно)
-- `--output_dir`: Директория для сохранения обученной модели (по умолчанию: ./lora_model)
-- `--num_train_epochs`: Количество эпох обучения (по умолчанию: 3)
-- `--per_device_train_batch_size`: Размер батча на устройство (по умолчанию: 4)
-- `--gradient_accumulation_steps`: Шаги накопления градиента (по умолчанию: 4)
-- `--learning_rate`: Скорость обучения (по умолчанию: 2e-4)
-- `--max_length`: Максимальная длина последовательности (по умолчанию: 512)
-- `--use_4bit`: Использовать 4-bit quantization для экономии памяти
-- `--lora_r`: Rank LoRA (по умолчанию: 16)
-- `--lora_alpha`: Alpha параметр LoRA (по умолчанию: 32)
-- `--lora_dropout`: Dropout для LoRA (по умолчанию: 0.05)
+- `--model_name` - базовая модель с Hugging Face
+- `--dataset_path` - путь к `.json` или `.jsonl`
+- `--output_dir` - папка, куда сохранить LoRA-веса
+- `--num_train_epochs` - число эпох
+- `--per_device_train_batch_size` - размер батча
+- `--gradient_accumulation_steps` - накопление градиента
+- `--max_length` - максимальная длина токенизированного примера
+- `--use_4bit` - квантование, только для GPU
+- `--device` - `auto`, `cpu` или `cuda`
 
-## Формат датасета
+## Рекомендации
 
-Скрипт поддерживает несколько форматов датасета:
+- Для CPU начинайте с `batch_size=1`
+- Для быстрого smoke-test используйте `sshleifer/tiny-gpt2`
+- Для GPU с маленькой VRAM используйте `--use_4bit`
+- Если на CPU случайно передан `--use_4bit`, скрипт сам его отключит
 
-1. **Простой текст**:
-```json
-[
-    {"text": "Ваш текст здесь"},
-    {"text": "Еще один текст"}
-]
-```
+## Пример датасета
 
-2. **Instruction-Output**:
-```json
-[
-    {
-        "instruction": "Вопрос или инструкция",
-        "output": "Ответ модели"
-    }
-]
-```
-
-3. **Prompt-Completion**:
-```json
-[
-    {
-        "prompt": "Промпт",
-        "completion": "Завершение"
-    }
-]
-```
-
-4. **Input-Output**:
-```json
-[
-    {
-        "input": "Входные данные",
-        "output": "Выходные данные"
-    }
-]
-```
-
-## Примечания
-
-- Используйте `--use_4bit` для экономии памяти на GPU
-- Уменьшите `per_device_train_batch_size` если возникают проблемы с памятью
-- Увеличьте `gradient_accumulation_steps` для эффективного обучения с маленькими батчами
+В проекте уже есть файл `example_dataset.json`, его можно использовать сразу.
 

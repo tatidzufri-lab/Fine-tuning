@@ -24,6 +24,13 @@ from peft import (
 import torch
 from transformers import BitsAndBytesConfig
 
+def format_metric(value, fmt):
+    """Безопасно форматирует метрику, даже если она пришла строкой."""
+    try:
+        return format(float(value), fmt)
+    except (TypeError, ValueError):
+        return str(value)
+
 class DetailedLoggingCallback(TrainerCallback):
     """Callback для детального логирования процесса обучения"""
     
@@ -53,16 +60,18 @@ class DetailedLoggingCallback(TrainerCallback):
         step = state.global_step
         loss = logs.get('loss', 'N/A')
         lr = logs.get('learning_rate', 'N/A')
+        loss_str = format_metric(loss, ".4f")
+        lr_str = format_metric(lr, ".2e")
         
         # Компактный вывод
         if state.max_steps:
             progress = (step / state.max_steps) * 100
-            print(f"Шаг {step}/{state.max_steps} ({progress:.1f}%) | Loss: {loss:.4f} | LR: {lr:.2e}", end='')
+            print(f"Шаг {step}/{state.max_steps} ({progress:.1f}%) | Loss: {loss_str} | LR: {lr_str}", end='')
         else:
-            print(f"Шаг {step} | Loss: {loss:.4f} | LR: {lr:.2e}", end='')
+            print(f"Шаг {step} | Loss: {loss_str} | LR: {lr_str}", end='')
         
         # Память GPU (только если используется)
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and not getattr(args, "use_cpu", False):
             mem = torch.cuda.memory_allocated(0) / 1024**3
             print(f" | GPU: {mem:.1f}GB")
         else:
@@ -72,7 +81,7 @@ class DetailedLoggingCallback(TrainerCallback):
         """Вызывается в конце каждой эпохи"""
         epoch_time = time.time() - self.epoch_start_time
         loss = state.log_history[-1].get('loss', 'N/A') if state.log_history else 'N/A'
-        print(f"Эпоха {state.epoch} завершена | Время: {epoch_time/60:.1f}мин | Loss: {loss:.4f}\n")
+        print(f"Эпоха {state.epoch} завершена | Время: {epoch_time/60:.1f}мин | Loss: {format_metric(loss, '.4f')}\n")
         
     def on_train_end(self, args, state, control, **kwargs):
         """Вызывается в конце обучения"""
@@ -80,7 +89,7 @@ class DetailedLoggingCallback(TrainerCallback):
         loss = state.log_history[-1].get('loss', 'N/A') if state.log_history else 'N/A'
         print(f"\n{'='*60}")
         print(f"ОБУЧЕНИЕ ЗАВЕРШЕНО")
-        print(f"Время: {total_time/60:.1f}мин | Шагов: {state.global_step} | Loss: {loss:.4f}")
+        print(f"Время: {total_time/60:.1f}мин | Шагов: {state.global_step} | Loss: {format_metric(loss, '.4f')}")
         print(f"{'='*60}\n")
 
 def print_system_info():
@@ -103,14 +112,12 @@ def print_system_info():
             print("Если возникают ошибки, установите:")
             print("pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124")
     else:
-        print("⚠ ВНИМАНИЕ: CUDA недоступна!")
+        print("[WARN] ВНИМАНИЕ: CUDA недоступна!")
         print("PyTorch установлен без поддержки GPU")
-        print("\nДля RTX 5060 установите PyTorch Nightly:")
-        print("pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124")
-        sys.exit(1)
+        print("Обучение будет выполняться на CPU")
     print("="*60)
 
-def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None):
+def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None, device="auto"):
     """
     Загружает модель и токенизатор
     
@@ -122,6 +129,12 @@ def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None):
     print(f"\n{'='*60}")
     print(f"ЗАГРУЗКА МОДЕЛИ: {model_name}")
     print(f"{'='*60}")
+    use_gpu = device != "cpu" and torch.cuda.is_available()
+
+    if use_4bit and not use_gpu:
+        print("[WARN] 4-bit quantization доступна только на GPU. Отключаем --use_4bit для CPU.")
+        use_4bit = False
+
     if use_4bit:
         print("Quantization: 4-bit")
     
@@ -159,31 +172,27 @@ def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    # Загрузка модели - ПРИНУДИТЕЛЬНО на GPU
+    # Загрузка модели
     model_start = time.time()
-    if not torch.cuda.is_available():
-        print("ОШИБКА: CUDA недоступна! Установите PyTorch с CUDA поддержкой")
-        sys.exit(1)
-    
-    # Принудительно используем GPU
-    device = "cuda:0"
-    device_map = "auto"
-    torch_dtype = torch.float16 if not use_4bit else None
-    
-    # Устанавливаем текущее устройство
-    torch.cuda.set_device(0)
-    
-    # Проверка compute capability для RTX 5060
-    compute_cap = torch.cuda.get_device_capability(0)
-    gpu_name = torch.cuda.get_device_name(0)
-    print(f"Устройство: GPU ({gpu_name})")
-    
-    if compute_cap[0] >= 12:
-        print(f"⚠ Обнаружена архитектура sm_{compute_cap[0]}{compute_cap[1]} (Blackwell)")
-        print("  Для RTX 5060 требуется PyTorch 2.5+ или nightly build")
-        if use_4bit:
-            print("  ⚠ Quantization может не работать с sm_120")
-            print("  Если возникнут ошибки, запустите БЕЗ --use_4bit")
+    if use_gpu:
+        device_map = "auto"
+        torch_dtype = torch.float16 if not use_4bit else None
+        torch.cuda.set_device(0)
+
+        compute_cap = torch.cuda.get_device_capability(0)
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"Устройство: GPU ({gpu_name})")
+
+        if compute_cap[0] >= 12:
+            print(f"[WARN] Обнаружена архитектура sm_{compute_cap[0]}{compute_cap[1]} (Blackwell)")
+            print("  Для RTX 5060 требуется PyTorch 2.5+ или newer build")
+            if use_4bit:
+                print("  [WARN] Quantization может не работать с sm_120")
+                print("  Если возникнут ошибки, запустите БЕЗ --use_4bit")
+    else:
+        device_map = None
+        torch_dtype = torch.float32
+        print("Устройство: CPU")
     
     # Проверяем, есть ли уже сохраненная модель локально
     config_path = os.path.join(cache_dir, "config.json")
@@ -223,41 +232,41 @@ def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None):
                     torch_dtype=torch_dtype,
                     trust_remote_code=True
                 )
-    else:
-        # Попытка загрузки с обработкой ошибок quantization для sm_120
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                quantization_config=bnb_config if use_4bit else None,
-                device_map=device_map,
-                torch_dtype=torch_dtype,
-                trust_remote_code=True
-            )
-            if not use_4bit:
-                model.save_pretrained(cache_dir)
-            else:
-                if hasattr(model, 'config'):
-                    model.config.save_pretrained(cache_dir)
-        except RuntimeError as e:
-            error_str = str(e)
-            if "no kernel image is available" in error_str or "CUDA capability" in error_str or "sm_120" in error_str:
-                print("\n" + "="*60)
-                print("ОШИБКА: Несовместимость с RTX 5060 (sm_120)")
-                print("="*60)
-                print("Проблема: bitsandbytes не поддерживает sm_120")
-                print("\nРешение 1: Установите PyTorch Nightly (рекомендуется)")
-                print("  pip uninstall torch torchvision torchaudio bitsandbytes")
-                print("  pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124")
-                print("  pip install bitsandbytes")
-                print("\nРешение 2: Запустите БЕЗ quantization")
-                print("  python train.py --model_name ... --dataset_path ...")
-                print("  (уберите флаг --use_4bit)")
-                print("="*60)
-                sys.exit(1)
-            else:
-                raise
+        else:
+            # Попытка загрузки с обработкой ошибок quantization для sm_120
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    quantization_config=bnb_config if use_4bit else None,
+                    device_map=device_map,
+                    torch_dtype=torch_dtype,
+                    trust_remote_code=True
+                )
+                if not use_4bit:
+                    model.save_pretrained(cache_dir)
+                else:
+                    if hasattr(model, 'config'):
+                        model.config.save_pretrained(cache_dir)
+            except RuntimeError as e:
+                error_str = str(e)
+                if "no kernel image is available" in error_str or "CUDA capability" in error_str or "sm_120" in error_str:
+                    print("\n" + "="*60)
+                    print("ОШИБКА: Несовместимость с RTX 5060 (sm_120)")
+                    print("="*60)
+                    print("Проблема: bitsandbytes не поддерживает sm_120")
+                    print("\nРешение 1: Установите PyTorch Nightly (рекомендуется)")
+                    print("  pip uninstall torch torchvision torchaudio bitsandbytes")
+                    print("  pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124")
+                    print("  pip install bitsandbytes")
+                    print("\nРешение 2: Запустите БЕЗ quantization")
+                    print("  python train.py --model_name ... --dataset_path ...")
+                    print("  (уберите флаг --use_4bit)")
+                    print("="*60)
+                    sys.exit(1)
+                else:
+                    raise
     except RuntimeError as e:
-        if "no kernel image is available" in str(e) or "CUDA capability" in str(e):
+        if use_gpu and ("no kernel image is available" in str(e) or "CUDA capability" in str(e)):
             print("\n" + "="*60)
             print("ОШИБКА: Несовместимость CUDA capability")
             print("="*60)
@@ -348,7 +357,7 @@ def setup_lora(model, r=16, lora_alpha=32, lora_dropout=0.05):
         
         if not target_modules:
             # Последняя попытка - используем стандартные для GPT-2
-            print("  ⚠ Не удалось определить модули, используем стандартные для GPT-2")
+            print("  [WARN] Не удалось определить модули, используем стандартные для GPT-2")
             target_modules = ["c_attn", "c_proj", "c_fc"]
         else:
             target_modules = list(set(target_modules))  # Убираем дубликаты
@@ -528,7 +537,8 @@ def train(
     lora_dropout=0.05,
     save_steps=500,
     logging_steps=10,
-    warmup_steps=100
+    warmup_steps=100,
+    device="auto"
 ):
     """
     Основная функция обучения
@@ -550,8 +560,22 @@ def train(
         logging_steps: шаги логирования
         warmup_steps: шаги warmup
     """
+    if device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("device должен быть одним из: auto, cpu, cuda")
+
+    use_gpu = device != "cpu" and torch.cuda.is_available()
+    resolved_device = "cuda:0" if use_gpu else "cpu"
+
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Запрошен device=cuda, но CUDA недоступна")
+
+    if use_4bit and not use_gpu:
+        print("[WARN] 4-bit quantization на CPU не поддерживается. Отключаем --use_4bit.")
+        use_4bit = False
+
     # Вывод информации о системе
     print_system_info()
+    print(f"Выбранное устройство: {resolved_device}")
     
     # Определяем директорию для сохранения обученной модели (в проекте)
     if not os.path.isabs(output_dir):
@@ -568,26 +592,29 @@ def train(
     base_model_cache_dir = os.path.join(project_root, "models", model_name.replace("/", "_"))
     
     # Загрузка модели и токенизатора
-    model, tokenizer = load_model_and_tokenizer(model_name, use_4bit=use_4bit, cache_dir=base_model_cache_dir)
+    model, tokenizer = load_model_and_tokenizer(
+        model_name,
+        use_4bit=use_4bit,
+        cache_dir=base_model_cache_dir,
+        device="cuda" if use_gpu else "cpu"
+    )
     
     # Настройка LoRA
     model = setup_lora(model, r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
     
-    # Проверка и принудительное перемещение на GPU
-    if not torch.cuda.is_available():
-        print("ОШИБКА: CUDA недоступна! Установите PyTorch с CUDA")
-        sys.exit(1)
-    
     try:
         model_device = next(model.parameters()).device
-        if model_device.type == 'cpu':
-            print("⚠ Модель на CPU, перемещаем на GPU...")
-            model = model.to("cuda:0")
+        if use_gpu and model_device.type == 'cpu':
+            print("[WARN] Модель на CPU, перемещаем на GPU...")
+            model = model.to(resolved_device)
+        elif not use_gpu and model_device.type != 'cpu':
+            print("[WARN] Модель не на CPU, перемещаем на CPU...")
+            model = model.to("cpu")
         else:
-            print(f"✓ Модель на GPU: {model_device}")
-    except:
-        model = model.to("cuda:0")
-        print("✓ Модель перемещена на GPU")
+            print(f"[OK] Модель на устройстве: {model_device}")
+    except Exception:
+        model = model.to(resolved_device)
+        print(f"[OK] Модель перемещена на {resolved_device}")
     
     # Загрузка датасета
     data = load_dataset_from_file(dataset_path)
@@ -617,12 +644,6 @@ def train(
     print(f"Warmup шагов: {warmup_steps}")
     print(f"Шаги логирования: {logging_steps}")
     print(f"Шаги сохранения: {save_steps}")
-    # ПРИНУДИТЕЛЬНОЕ использование GPU
-    if not torch.cuda.is_available():
-        print("ОШИБКА: CUDA недоступна! Обучение невозможно без GPU")
-        sys.exit(1)
-    
-    use_gpu = True  # Принудительно используем GPU
     use_gradient_checkpointing = False  # Инициализация
     
     # Проверка конкретной GPU модели
@@ -636,7 +657,7 @@ def train(
         if "RTX 5060" in gpu_name or gpu_memory_gb < 10:
             use_gradient_checkpointing = True
             if per_device_train_batch_size > 4:
-                print(f"⚠ Батч {per_device_train_batch_size} может быть слишком большим для 8GB GPU")
+                print(f"[WARN] Батч {per_device_train_batch_size} может быть слишком большим для 8GB GPU")
         else:
             use_gradient_checkpointing = False
     
@@ -659,7 +680,7 @@ def train(
         dataloader_pin_memory = False
         dataloader_num_workers = 0
         use_gradient_checkpointing = False
-        print("⚠ Обучение на CPU будет очень медленным!\n")
+        print("[WARN] Обучение на CPU будет очень медленным!\n")
     
     # Включаем gradient checkpointing если нужно
     if use_gpu and use_gradient_checkpointing:
@@ -682,6 +703,7 @@ def train(
         save_total_limit=3,
         load_best_model_at_end=False,
         report_to="none",
+        use_cpu=not use_gpu,
         optim=optim_name,
         logging_first_step=True,
         logging_dir=os.path.join(output_dir, "logs"),
@@ -702,13 +724,13 @@ def train(
         callbacks=[DetailedLoggingCallback()],
     )
     
-    # Убеждаемся что модель на GPU перед обучением
+    # Убеждаемся что модель на нужном устройстве перед обучением
     try:
         model_device = next(model.parameters()).device
-        if model_device.type != 'cuda':
-            print("Перемещение модели на GPU перед обучением...")
-            model = model.to("cuda:0")
-            # Обновляем trainer с моделью на GPU
+        target_device_type = "cuda" if use_gpu else "cpu"
+        if model_device.type != target_device_type:
+            print(f"Перемещение модели на {resolved_device} перед обучением...")
+            model = model.to(resolved_device)
             trainer = Trainer(
                 model=model,
                 args=training_args,
@@ -716,8 +738,8 @@ def train(
                 data_collator=data_collator,
                 callbacks=[DetailedLoggingCallback()],
             )
-    except:
-        model = model.to("cuda:0")
+    except Exception:
+        model = model.to(resolved_device)
         trainer = Trainer(
             model=model,
             args=training_args,
@@ -727,13 +749,16 @@ def train(
         )
     
     # Информация о памяти перед обучением
-    mem = torch.cuda.memory_reserved(0) / 1024**3
-    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    free = total - mem
-    print(f"GPU память: {mem:.1f}/{total:.1f}GB (свободно: {free:.1f}GB)")
-    if free < 1.0:
-        print("⚠ Мало памяти! Уменьшите batch_size")
-    torch.cuda.empty_cache()
+    if use_gpu:
+        mem = torch.cuda.memory_reserved(0) / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        free = total - mem
+        print(f"GPU память: {mem:.1f}/{total:.1f}GB (свободно: {free:.1f}GB)")
+        if free < 1.0:
+            print("[WARN] Мало памяти! Уменьшите batch_size")
+        torch.cuda.empty_cache()
+    else:
+        print("Обучение запускается на CPU. Это может быть заметно медленнее.")
     print()
     
     # Обучение
@@ -746,7 +771,7 @@ def train(
     speed = len(train_dataset) * num_train_epochs / train_time if train_time > 0 else 0
     print(f"\n{'='*60}")
     print(f"ОБУЧЕНИЕ ЗАВЕРШЕНО")
-    print(f"Время: {train_time/60:.1f}мин | Скорость: {speed:.1f} примеров/сек | Loss: {loss:.4f}")
+    print(f"Время: {train_time/60:.1f}мин | Скорость: {speed:.1f} примеров/сек | Loss: {format_metric(loss, '.4f')}")
     print(f"{'='*60}\n")
     
     # Сохранение модели
@@ -755,7 +780,7 @@ def train(
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     save_time = time.time() - save_start
-    print(f"✓ Сохранено за {save_time:.1f}с | Путь: {os.path.abspath(output_dir)}")
+    print(f"[OK] Сохранено за {save_time:.1f}с | Путь: {os.path.abspath(output_dir)}")
 
 if __name__ == "__main__":
     import argparse
@@ -776,6 +801,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_steps", type=int, default=500, help="Шаги сохранения")
     parser.add_argument("--logging_steps", type=int, default=10, help="Шаги логирования")
     parser.add_argument("--warmup_steps", type=int, default=100, help="Шаги warmup")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Устройство для обучения")
     
     args = parser.parse_args()
     
@@ -795,5 +821,6 @@ if __name__ == "__main__":
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
         warmup_steps=args.warmup_steps,
+        device=args.device,
     )
 
