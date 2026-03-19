@@ -13,7 +13,8 @@ from transformers import (
     TrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
-    TrainerCallback
+    TrainerCallback,
+    default_data_collator,
 )
 from peft import (
     LoraConfig,
@@ -70,10 +71,16 @@ class DetailedLoggingCallback(TrainerCallback):
         else:
             print(f"Шаг {step} | Loss: {loss_str} | LR: {lr_str}", end='')
         
-        # Память GPU (только если используется)
+        # Память GPU (CUDA или MPS)
         if torch.cuda.is_available() and not getattr(args, "use_cpu", False):
             mem = torch.cuda.memory_allocated(0) / 1024**3
             print(f" | GPU: {mem:.1f}GB")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            if hasattr(torch.mps, "current_allocated_memory"):
+                mem = torch.mps.current_allocated_memory() / 1024**3
+                print(f" | MPS: {mem:.1f}GB")
+            else:
+                print()
         else:
             print()
         
@@ -92,12 +99,38 @@ class DetailedLoggingCallback(TrainerCallback):
         print(f"Время: {total_time/60:.1f}мин | Шагов: {state.global_step} | Loss: {format_metric(loss, '.4f')}")
         print(f"{'='*60}\n")
 
-def print_system_info():
+def _resolve_device(device_arg):
+    """
+    Определяет устройство для обучения.
+    Возвращает (resolved_device, use_gpu, backend) где backend = 'cuda' | 'mps' | 'cpu'.
+    """
+    if device_arg == "cpu":
+        return "cpu", False, "cpu"
+
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("Запрошен device=cuda, но CUDA недоступна")
+        return "cuda:0", True, "cuda"
+
+    if device_arg == "mps":
+        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            raise RuntimeError("Запрошен device=mps, но MPS недоступен")
+        return "mps", True, "mps"
+
+    # device == "auto": выбираем лучшее доступное
+    if torch.cuda.is_available():
+        return "cuda:0", True, "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps", True, "mps"
+    return "cpu", False, "cpu"
+
+
+def print_system_info(backend):
     """Выводит информацию о системе"""
     print("\n" + "="*60)
     print("СИСТЕМА")
     print("="*60)
-    if torch.cuda.is_available():
+    if backend == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
         cuda_version = torch.version.cuda
@@ -105,15 +138,20 @@ def print_system_info():
         print(f"GPU: {gpu_name} ({gpu_memory:.1f}GB)")
         print(f"CUDA: {cuda_version}")
         print(f"Compute Capability: {compute_capability[0]}.{compute_capability[1]}")
-        
-        # Проверка совместимости для RTX 5060 (sm_120)
         if compute_capability[0] >= 12:
-            print("⚠ RTX 5060 (sm_120) требует PyTorch 2.5+ или nightly build")
-            print("Если возникают ошибки, установите:")
-            print("pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124")
+            print("[WARN] RTX 5060 (sm_120) требует PyTorch 2.5+ или nightly build")
+    elif backend == "mps":
+        import platform
+        print(f"GPU: Apple Silicon ({platform.processor() or 'M-series'})")
+        print(f"Backend: MPS (Metal Performance Shaders)")
+        try:
+            import psutil
+            mem_gb = psutil.virtual_memory().total / 1024**3
+            print(f"Unified Memory: {mem_gb:.0f}GB")
+        except ImportError:
+            pass
     else:
-        print("[WARN] ВНИМАНИЕ: CUDA недоступна!")
-        print("PyTorch установлен без поддержки GPU")
+        print("[WARN] ВНИМАНИЕ: GPU недоступен!")
         print("Обучение будет выполняться на CPU")
     print("="*60)
 
@@ -129,10 +167,12 @@ def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None, device="
     print(f"\n{'='*60}")
     print(f"ЗАГРУЗКА МОДЕЛИ: {model_name}")
     print(f"{'='*60}")
-    use_gpu = device != "cpu" and torch.cuda.is_available()
+    use_cuda = device == "cuda" and torch.cuda.is_available()
+    use_mps = device == "mps"
+    use_gpu = use_cuda or use_mps
 
-    if use_4bit and not use_gpu:
-        print("[WARN] 4-bit quantization доступна только на GPU. Отключаем --use_4bit для CPU.")
+    if use_4bit and not use_cuda:
+        print("[WARN] 4-bit quantization доступна только на NVIDIA GPU. Отключаем --use_4bit.")
         use_4bit = False
 
     if use_4bit:
@@ -171,17 +211,20 @@ def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None, device="
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
+        print(f"Pad token: установлен как eos_token ({tokenizer.pad_token})")
+    else:
+        print(f"Pad token: {tokenizer.pad_token} (id={tokenizer.pad_token_id})")
     
     # Загрузка модели
     model_start = time.time()
-    if use_gpu:
+    if use_cuda:
         device_map = "auto"
         torch_dtype = torch.float16 if not use_4bit else None
         torch.cuda.set_device(0)
 
         compute_cap = torch.cuda.get_device_capability(0)
         gpu_name = torch.cuda.get_device_name(0)
-        print(f"Устройство: GPU ({gpu_name})")
+        print(f"Устройство: CUDA GPU ({gpu_name})")
 
         if compute_cap[0] >= 12:
             print(f"[WARN] Обнаружена архитектура sm_{compute_cap[0]}{compute_cap[1]} (Blackwell)")
@@ -189,6 +232,10 @@ def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None, device="
             if use_4bit:
                 print("  [WARN] Quantization может не работать с sm_120")
                 print("  Если возникнут ошибки, запустите БЕЗ --use_4bit")
+    elif use_mps:
+        device_map = None
+        torch_dtype = torch.float32
+        print("Устройство: MPS (Apple Silicon GPU)")
     else:
         device_map = None
         torch_dtype = torch.float32
@@ -422,110 +469,214 @@ def load_dataset_from_file(dataset_path):
     
     return data
 
+def _detect_chat_template(tokenizer):
+    """Проверяет, есть ли у токенизатора chat template."""
+    return hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None
+
+
+def _example_to_messages(example):
+    """
+    Конвертирует пример датасета в список сообщений для chat template.
+
+    Поддерживаемые форматы:
+    - instruction/input/output  -> system + user + assistant
+    - instruction/output        -> user + assistant
+    - prompt/completion         -> user + assistant
+    - input/output              -> user + assistant
+    - text                      -> user
+    """
+    if 'instruction' in example and 'input' in example and 'output' in example:
+        return [
+            {"role": "system", "content": example["instruction"]},
+            {"role": "user", "content": example["input"]},
+            {"role": "assistant", "content": example["output"]},
+        ]
+    if 'instruction' in example and 'output' in example:
+        return [
+            {"role": "user", "content": example["instruction"]},
+            {"role": "assistant", "content": example["output"]},
+        ]
+    if 'prompt' in example and 'completion' in example:
+        return [
+            {"role": "user", "content": example["prompt"]},
+            {"role": "assistant", "content": example["completion"]},
+        ]
+    if 'input' in example and 'output' in example:
+        return [
+            {"role": "user", "content": example["input"]},
+            {"role": "assistant", "content": example["output"]},
+        ]
+    if 'text' in example:
+        return [{"role": "user", "content": example["text"]}]
+    text_keys = [k for k in example.keys() if 'text' in k.lower() or 'content' in k.lower()]
+    if text_keys:
+        return [{"role": "user", "content": example[text_keys[0]]}]
+    return [{"role": "user", "content": str(example)}]
+
+
+def _format_prompt_legacy(example):
+    """Форматирование для моделей без chat template (обратная совместимость)."""
+    if 'text' in example:
+        return example['text']
+    if 'instruction' in example and 'input' in example and 'output' in example:
+        return (
+            f"### System:\n{example['instruction']}\n\n"
+            f"### Instruction:\n{example['input']}\n\n"
+            f"### Response:\n{example['output']}"
+        )
+    if 'instruction' in example and 'output' in example:
+        return f"### Instruction:\n{example['instruction']}\n\n### Response:\n{example['output']}"
+    if 'prompt' in example and 'completion' in example:
+        return f"{example['prompt']}\n\n{example['completion']}"
+    if 'input' in example and 'output' in example:
+        return f"Input: {example['input']}\nOutput: {example['output']}"
+    text_keys = [k for k in example.keys() if 'text' in k.lower() or 'content' in k.lower()]
+    if text_keys:
+        return example[text_keys[0]]
+    return str(example)
+
+
 def preprocess_dataset(data, tokenizer, max_length=512):
     """
-    Предобрабатывает датасет для обучения
-    
-    Args:
-        data: список словарей с данными
-        tokenizer: токенизатор
-        max_length: максимальная длина последовательности
+    Предобрабатывает датасет для обучения.
+
+    Для instruct-моделей с chat template:
+      - форматирует данные через apply_chat_template
+      - маскирует loss на промпте (system + user), оставляя только ответ assistant
+
+    Для моделей без chat template:
+      - форматирует как плоский текст (обратная совместимость)
     """
     print(f"{'='*60}")
     print(f"ПРЕДОБРАБОТКА | max_length={max_length}")
     print(f"{'='*60}")
-    
+
     preprocess_start = time.time()
-    
-    def format_prompt(example):
-        """
-        Форматирует пример в промпт
-        Поддерживает разные форматы датасета
-        """
-        if 'text' in example:
-            # Простой текст
-            return example['text']
-        elif 'instruction' in example and 'output' in example:
-            # Формат instruction-output
-            return f"### Instruction:\n{example['instruction']}\n\n### Response:\n{example['output']}"
-        elif 'prompt' in example and 'completion' in example:
-            # Формат prompt-completion
-            return f"{example['prompt']}\n\n{example['completion']}"
-        elif 'input' in example and 'output' in example:
-            # Формат input-output
-            return f"Input: {example['input']}\nOutput: {example['output']}"
-        else:
-            # Пытаемся найти любой текстовый ключ
-            text_keys = [k for k in example.keys() if 'text' in k.lower() or 'content' in k.lower()]
-            if text_keys:
-                return example[text_keys[0]]
-            else:
-                return str(example)
-    
-    # Анализ длины текстов (только статистика)
+    use_chat_template = _detect_chat_template(tokenizer)
+
+    if use_chat_template:
+        print("Режим: chat template (instruct)")
+    else:
+        print("Режим: плоский текст (legacy)")
+
+    # --- Статистика длины ---
     text_lengths = []
     for example in data[:min(100, len(data))]:
-        text = format_prompt(example)
-        tokens = tokenizer.encode(text, add_special_tokens=False)
-        text_lengths.append(len(tokens))
-    
+        if use_chat_template:
+            messages = _example_to_messages(example)
+            ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False, return_dict=False)
+        else:
+            text = _format_prompt_legacy(example)
+            ids = tokenizer.encode(text, add_special_tokens=True)
+        text_lengths.append(len(ids))
+
     if text_lengths:
         avg_tokens = sum(text_lengths) / len(text_lengths)
+        max_tokens = max(text_lengths)
         truncated = sum(1 for t in text_lengths if t > max_length)
-        print(f"Средняя длина: {avg_tokens:.0f} токенов | Обрезано: {truncated}/{len(text_lengths)}")
-    
-    def tokenize_function(examples):
-        """
-        Токенизирует примеры
-        При batched=True examples - это словарь со списками значений
-        """
-        # Преобразуем batched формат в список словарей
-        # examples это словарь вида {'instruction': [list], 'output': [list], ...}
-        batch_size = len(list(examples.values())[0])
-        examples_list = []
-        for i in range(batch_size):
-            example_dict = {key: examples[key][i] for key in examples.keys()}
-            examples_list.append(example_dict)
-        
-        # Форматируем каждый пример
-        texts = [format_prompt(ex) for ex in examples_list]
-        
-        # Токенизация (без return_tensors, чтобы вернуть списки)
-        tokenized = tokenizer(
-            texts,
-            truncation=True,
-            max_length=max_length,
-            padding="max_length"
-        )
-        
-        # Добавляем labels (копия input_ids)
-        tokenized["labels"] = tokenized["input_ids"].copy()
-        
-        return tokenized
-    
-    # Преобразуем в формат для datasets
+        print(f"Средняя длина: {avg_tokens:.0f} токенов | Макс: {max_tokens} | Обрезано: {truncated}/{len(text_lengths)}")
+
+    # --- Токенизация ---
     from datasets import Dataset
     dataset = Dataset.from_list(data)
-    
-    # Токенизация
-    tokenized_dataset = dataset.map(
-        tokenize_function,
-        batched=True,
-        batch_size=1000,
-        remove_columns=dataset.column_names,
-        desc="Токенизация"
-    )
-    
+
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    if use_chat_template:
+        def tokenize_chat(examples):
+            batch_size = len(list(examples.values())[0])
+            all_input_ids = []
+            all_attention_mask = []
+            all_labels = []
+
+            for i in range(batch_size):
+                ex = {key: examples[key][i] for key in examples.keys()}
+                messages = _example_to_messages(ex)
+
+                full_ids = tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=False,
+                    return_dict=False,
+                )
+
+                prompt_messages = [m for m in messages if m["role"] != "assistant"]
+                prompt_ids = tokenizer.apply_chat_template(
+                    prompt_messages, tokenize=True, add_generation_prompt=True,
+                    return_dict=False,
+                )
+                prompt_len = len(prompt_ids)
+
+                full_ids = full_ids[:max_length]
+                seq_len = len(full_ids)
+                padding_length = max_length - seq_len
+
+                input_ids = full_ids + [pad_id] * padding_length
+                attention_mask = [1] * seq_len + [0] * padding_length
+
+                labels = (
+                    [-100] * min(prompt_len, seq_len)
+                    + full_ids[prompt_len:]
+                    + [-100] * padding_length
+                )
+                labels = labels[:max_length]
+
+                all_input_ids.append(input_ids)
+                all_attention_mask.append(attention_mask)
+                all_labels.append(labels)
+
+            return {
+                "input_ids": all_input_ids,
+                "attention_mask": all_attention_mask,
+                "labels": all_labels,
+            }
+
+        tokenized_dataset = dataset.map(
+            tokenize_chat,
+            batched=True,
+            batch_size=256,
+            remove_columns=dataset.column_names,
+            desc="Токенизация (chat template)",
+        )
+    else:
+        def tokenize_legacy(examples):
+            batch_size = len(list(examples.values())[0])
+            examples_list = []
+            for i in range(batch_size):
+                example_dict = {key: examples[key][i] for key in examples.keys()}
+                examples_list.append(example_dict)
+
+            texts = [_format_prompt_legacy(ex) for ex in examples_list]
+            tokenized = tokenizer(
+                texts, truncation=True, max_length=max_length, padding="max_length"
+            )
+            tokenized["labels"] = tokenized["input_ids"].copy()
+            return tokenized
+
+        tokenized_dataset = dataset.map(
+            tokenize_legacy,
+            batched=True,
+            batch_size=1000,
+            remove_columns=dataset.column_names,
+            desc="Токенизация (legacy)",
+        )
+
     preprocess_time = time.time() - preprocess_start
     total_tokens = sum(len(ids) for ids in tokenized_dataset['input_ids'])
-    print(f"Токенизировано: {len(tokenized_dataset)} примеров, {total_tokens/1e3:.0f}K токенов | Время: {preprocess_time:.1f}с\n")
-    
-    return tokenized_dataset
+    non_masked = sum(
+        sum(1 for l in labels if l != -100)
+        for labels in tokenized_dataset['labels']
+    )
+    print(f"Токенизировано: {len(tokenized_dataset)} примеров, {total_tokens/1e3:.0f}K токенов")
+    if use_chat_template:
+        print(f"Токенов для обучения (assistant): {non_masked/1e3:.0f}K ({non_masked*100//total_tokens}% от общего)")
+    print(f"Время: {preprocess_time:.1f}с\n")
+
+    return tokenized_dataset, use_chat_template
 
 def train(
     model_name,
     dataset_path,
     output_dir="./lora_model",
+    eval_dataset_path=None,
     num_train_epochs=3,
     per_device_train_batch_size=4,
     gradient_accumulation_steps=4,
@@ -535,18 +686,19 @@ def train(
     lora_r=16,
     lora_alpha=32,
     lora_dropout=0.05,
-    save_steps=500,
-    logging_steps=10,
-    warmup_steps=100,
+    save_steps=100,
+    logging_steps=5,
+    warmup_steps=20,
     device="auto"
 ):
     """
     Основная функция обучения
-    
+
     Args:
         model_name: имя модели с HuggingFace
         dataset_path: путь к датасету
         output_dir: директория для сохранения модели
+        eval_dataset_path: путь к валидационному датасету (опционально)
         num_train_epochs: количество эпох
         per_device_train_batch_size: размер батча на устройство
         gradient_accumulation_steps: шаги накопления градиента
@@ -560,22 +712,15 @@ def train(
         logging_steps: шаги логирования
         warmup_steps: шаги warmup
     """
-    if device not in {"auto", "cpu", "cuda"}:
-        raise ValueError("device должен быть одним из: auto, cpu, cuda")
+    resolved_device, use_gpu, backend = _resolve_device(device)
 
-    use_gpu = device != "cpu" and torch.cuda.is_available()
-    resolved_device = "cuda:0" if use_gpu else "cpu"
-
-    if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("Запрошен device=cuda, но CUDA недоступна")
-
-    if use_4bit and not use_gpu:
-        print("[WARN] 4-bit quantization на CPU не поддерживается. Отключаем --use_4bit.")
+    if use_4bit and backend != "cuda":
+        print("[WARN] 4-bit quantization доступна только на NVIDIA GPU. Отключаем --use_4bit.")
         use_4bit = False
 
     # Вывод информации о системе
-    print_system_info()
-    print(f"Выбранное устройство: {resolved_device}")
+    print_system_info(backend)
+    print(f"Выбранное устройство: {resolved_device} (backend: {backend})")
     
     # Определяем директорию для сохранения обученной модели (в проекте)
     if not os.path.isabs(output_dir):
@@ -596,7 +741,7 @@ def train(
         model_name,
         use_4bit=use_4bit,
         cache_dir=base_model_cache_dir,
-        device="cuda" if use_gpu else "cpu"
+        device=backend,
     )
     
     # Настройка LoRA
@@ -604,27 +749,35 @@ def train(
     
     try:
         model_device = next(model.parameters()).device
-        if use_gpu and model_device.type == 'cpu':
-            print("[WARN] Модель на CPU, перемещаем на GPU...")
+        if str(model_device) != resolved_device and not (model_device.type == resolved_device):
+            print(f"Перемещение модели с {model_device} на {resolved_device}...")
             model = model.to(resolved_device)
-        elif not use_gpu and model_device.type != 'cpu':
-            print("[WARN] Модель не на CPU, перемещаем на CPU...")
-            model = model.to("cpu")
-        else:
-            print(f"[OK] Модель на устройстве: {model_device}")
+        print(f"[OK] Модель на устройстве: {next(model.parameters()).device}")
     except Exception:
         model = model.to(resolved_device)
         print(f"[OK] Модель перемещена на {resolved_device}")
     
     # Загрузка датасета
     data = load_dataset_from_file(dataset_path)
-    train_dataset = preprocess_dataset(data, tokenizer, max_length=max_length)
-    
-    # Data collator
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False  # Causal LM, не masked LM
-    )
+    train_dataset, use_chat_tpl = preprocess_dataset(data, tokenizer, max_length=max_length)
+
+    # Загрузка eval датасета
+    eval_dataset = None
+    if eval_dataset_path:
+        eval_data = load_dataset_from_file(eval_dataset_path)
+        eval_dataset, _ = preprocess_dataset(eval_data, tokenizer, max_length=max_length)
+        print(f"Eval датасет: {len(eval_dataset)} примеров")
+
+    # Data collator: для chat template labels уже содержат маскировку,
+    # используем default_data_collator чтобы не перезаписать их;
+    # для legacy формата — DataCollatorForLanguageModeling маскирует pad сам
+    if use_chat_tpl:
+        data_collator = default_data_collator
+    else:
+        data_collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            mlm=False,
+        )
     
     # Вычисляем общее количество шагов
     total_steps = len(train_dataset) // (per_device_train_batch_size * gradient_accumulation_steps) * num_train_epochs
@@ -647,33 +800,32 @@ def train(
     use_gradient_checkpointing = False  # Инициализация
     
     # Проверка конкретной GPU модели
-    gpu_name = None
-    gpu_memory_gb = None
-    if use_gpu:
+    if backend == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        
-        # RTX 5060 имеет ~8GB VRAM, оптимизируем настройки
         if "RTX 5060" in gpu_name or gpu_memory_gb < 10:
             use_gradient_checkpointing = True
             if per_device_train_batch_size > 4:
                 print(f"[WARN] Батч {per_device_train_batch_size} может быть слишком большим для 8GB GPU")
-        else:
-            use_gradient_checkpointing = False
-    
-    if use_4bit and use_gpu:
+
+    if use_4bit and backend == "cuda":
         optim_name = "paged_adamw_8bit"
-    elif use_gpu:
-        optim_name = "adamw_torch"
     else:
         optim_name = "adamw_torch"
-    
-    # Настройки для GPU
-    if use_gpu:
+
+    # Настройки precision и dataloader по backend
+    if backend == "cuda":
         fp16 = True
         bf16 = False
         dataloader_pin_memory = True
         dataloader_num_workers = 4
+    elif backend == "mps":
+        fp16 = False
+        bf16 = False
+        dataloader_pin_memory = False
+        dataloader_num_workers = 0
+        use_gradient_checkpointing = False
+        print("[OK] MPS: float32, gradient checkpointing выключен")
     else:
         fp16 = False
         bf16 = False
@@ -681,11 +833,18 @@ def train(
         dataloader_num_workers = 0
         use_gradient_checkpointing = False
         print("[WARN] Обучение на CPU будет очень медленным!\n")
-    
-    # Включаем gradient checkpointing если нужно
+
     if use_gpu and use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
     
+    # Eval strategy
+    eval_strategy = "no"
+    eval_steps = None
+    if eval_dataset is not None:
+        eval_strategy = "steps"
+        eval_steps = max(save_steps, 1)
+        print(f"Evaluation: каждые {eval_steps} шагов")
+
     # Аргументы обучения
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -693,63 +852,58 @@ def train(
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
-        fp16=fp16,  # FP16 для RTX 5060
-        bf16=bf16,  # BF16 не поддерживается RTX 5060
+        fp16=fp16,
+        bf16=bf16,
         dataloader_pin_memory=dataloader_pin_memory,
         dataloader_num_workers=dataloader_num_workers,
         logging_steps=logging_steps,
         save_steps=save_steps,
         warmup_steps=warmup_steps,
         save_total_limit=3,
-        load_best_model_at_end=False,
+        eval_strategy=eval_strategy,
+        eval_steps=eval_steps,
+        load_best_model_at_end=eval_dataset is not None,
+        metric_for_best_model="eval_loss" if eval_dataset is not None else None,
+        greater_is_better=False if eval_dataset is not None else None,
         report_to="none",
-        use_cpu=not use_gpu,
+        use_cpu=(backend == "cpu"),
         optim=optim_name,
         logging_first_step=True,
         logging_dir=os.path.join(output_dir, "logs"),
-        remove_unused_columns=False,  # Сохраняем все колонки
-        ddp_find_unused_parameters=False if use_gpu else None,  # Оптимизация для multi-GPU
-        gradient_checkpointing=use_gradient_checkpointing if use_gpu else False,  # Экономия памяти
+        remove_unused_columns=False,
+        ddp_find_unused_parameters=False if use_gpu else None,
+        gradient_checkpointing=use_gradient_checkpointing if use_gpu else False,
     )
     
     # Создаем директорию для логов
     os.makedirs(os.path.join(output_dir, "logs"), exist_ok=True)
     
     # Trainer с callback для детального логирования
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        data_collator=data_collator,
-        callbacks=[DetailedLoggingCallback()],
-    )
-    
-    # Убеждаемся что модель на нужном устройстве перед обучением
-    try:
-        model_device = next(model.parameters()).device
-        target_device_type = "cuda" if use_gpu else "cpu"
-        if model_device.type != target_device_type:
-            print(f"Перемещение модели на {resolved_device} перед обучением...")
-            model = model.to(resolved_device)
-            trainer = Trainer(
-                model=model,
-                args=training_args,
-                train_dataset=train_dataset,
-                data_collator=data_collator,
-                callbacks=[DetailedLoggingCallback()],
-            )
-    except Exception:
-        model = model.to(resolved_device)
-        trainer = Trainer(
+    def _make_trainer():
+        return Trainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
             data_collator=data_collator,
             callbacks=[DetailedLoggingCallback()],
         )
+
+    trainer = _make_trainer()
+
+    # Убеждаемся что модель на нужном устройстве перед обучением
+    try:
+        model_device = next(model.parameters()).device
+        if model_device.type != backend and not (backend == "cpu" and model_device.type == "cpu"):
+            print(f"Перемещение модели на {resolved_device} перед обучением...")
+            model = model.to(resolved_device)
+            trainer = _make_trainer()
+    except Exception:
+        model = model.to(resolved_device)
+        trainer = _make_trainer()
     
     # Информация о памяти перед обучением
-    if use_gpu:
+    if backend == "cuda":
         mem = torch.cuda.memory_reserved(0) / 1024**3
         total = torch.cuda.get_device_properties(0).total_memory / 1024**3
         free = total - mem
@@ -757,6 +911,11 @@ def train(
         if free < 1.0:
             print("[WARN] Мало памяти! Уменьшите batch_size")
         torch.cuda.empty_cache()
+    elif backend == "mps":
+        if hasattr(torch.mps, "current_allocated_memory"):
+            mem_mb = torch.mps.current_allocated_memory() / 1024**2
+            print(f"MPS память: {mem_mb:.0f}MB выделено")
+        print("Обучение на Apple Silicon GPU (MPS)")
     else:
         print("Обучение запускается на CPU. Это может быть заметно медленнее.")
     print()
@@ -788,6 +947,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fine-tuning модели с LoRA")
     parser.add_argument("--model_name", type=str, required=True, help="Имя модели с HuggingFace")
     parser.add_argument("--dataset_path", type=str, required=True, help="Путь к датасету (.json или .jsonl)")
+    parser.add_argument("--eval_dataset_path", type=str, default=None, help="Путь к валидационному датасету (.json или .jsonl)")
     parser.add_argument("--output_dir", type=str, default="./lora_model", help="Директория для сохранения")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Количество эпох")
     parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="Размер батча")
@@ -798,17 +958,18 @@ if __name__ == "__main__":
     parser.add_argument("--lora_r", type=int, default=16, help="Rank LoRA")
     parser.add_argument("--lora_alpha", type=int, default=32, help="Alpha LoRA")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="Dropout LoRA")
-    parser.add_argument("--save_steps", type=int, default=500, help="Шаги сохранения")
-    parser.add_argument("--logging_steps", type=int, default=10, help="Шаги логирования")
-    parser.add_argument("--warmup_steps", type=int, default=100, help="Шаги warmup")
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Устройство для обучения")
-    
+    parser.add_argument("--save_steps", type=int, default=100, help="Шаги сохранения")
+    parser.add_argument("--logging_steps", type=int, default=5, help="Шаги логирования")
+    parser.add_argument("--warmup_steps", type=int, default=20, help="Шаги warmup")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"], help="Устройство: auto, cpu, cuda, mps (Apple Silicon)")
+
     args = parser.parse_args()
-    
+
     train(
         model_name=args.model_name,
         dataset_path=args.dataset_path,
         output_dir=args.output_dir,
+        eval_dataset_path=args.eval_dataset_path,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,

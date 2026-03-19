@@ -17,7 +17,11 @@ models/
 *.pth
 *.ckpt
 lora_model/
+fine_tuning/lora_retrit/
 *.jsonl
+# Датасет проекта — исключение из правила выше
+!dataset_retrit_poznaisebia/
+!dataset_retrit_poznaisebia/*.jsonl
 
 # Логи и кэш
 logs/

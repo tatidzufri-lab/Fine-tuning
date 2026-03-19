@@ -17,32 +17,28 @@ def load_model_and_tokenizer(base_model_name, lora_model_path=None):
     """
     print(f"Загрузка модели {base_model_name}...")
     
-    # Проверка наличия GPU
+    # Выбор устройства: CUDA > MPS > CPU
     if torch.cuda.is_available():
         device = "cuda"
-        device_count = torch.cuda.device_count()
-        current_device = torch.cuda.current_device()
-        device_name = torch.cuda.get_device_name(current_device)
-        print(f"\n{'='*60}")
-        print(f"ИСПОЛЬЗОВАНИЕ GPU")
-        print(f"{'='*60}")
-        print(f"GPU устройство: {device_name}")
-        print(f"Количество GPU: {device_count}")
-        print(f"Текущий GPU: {current_device}")
-        
-        # Показываем информацию о памяти GPU
-        for i in range(device_count):
-            total_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
-            print(f"GPU {i} память: {total_memory:.2f} GB")
-        print(f"{'='*60}\n")
-        
         torch_dtype = torch.float16
         device_map = "auto"
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"\n{'='*60}")
+        print(f"Устройство: CUDA GPU ({gpu_name}, {gpu_mem:.1f}GB)")
+        print(f"{'='*60}\n")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+        torch_dtype = torch.float32
+        device_map = None
+        print(f"\n{'='*60}")
+        print(f"Устройство: MPS (Apple Silicon GPU)")
+        print(f"{'='*60}\n")
     else:
         device = "cpu"
         torch_dtype = torch.float32
         device_map = None
-        print(f"\n⚠ ВНИМАНИЕ: GPU не обнаружен, используется CPU")
+        print(f"\n[WARN] GPU не обнаружен, используется CPU")
         print(f"Генерация на CPU будет медленной!\n")
     
     # Определяем директорию для базовой модели (в проекте)
@@ -92,161 +88,135 @@ def load_model_and_tokenizer(base_model_name, lora_model_path=None):
         model.save_pretrained(base_model_cache_dir)
         print(f"Модель сохранена!")
     
-    # Показываем информацию о памяти GPU после загрузки
-    if torch.cuda.is_available():
-        print(f"\nСостояние памяти GPU после загрузки:")
-        for i in range(torch.cuda.device_count()):
-            allocated = torch.cuda.memory_allocated(i) / 1024**3
-            reserved = torch.cuda.memory_reserved(i) / 1024**3
-            total = torch.cuda.get_device_properties(i).total_memory / 1024**3
-            free = total - reserved
-            print(f"  GPU {i}: {allocated:.2f}GB / {reserved:.2f}GB (свободно: {free:.2f}GB)")
-    
     # Загрузка LoRA весов если указан путь
     if lora_model_path and os.path.exists(lora_model_path):
         print(f"Загрузка LoRA весов из {lora_model_path}...")
         model = PeftModel.from_pretrained(model, lora_model_path)
-        model = model.merge_and_unload()  # Объединяем LoRA веса с базовой моделью
+        model = model.merge_and_unload()
         print("LoRA веса успешно загружены и объединены!")
     elif lora_model_path:
         print(f"Предупреждение: Путь {lora_model_path} не найден. Используется базовая модель.")
-    
-    # Переводим модель в режим оценки
+
+    # Перемещаем на MPS если доступен (device_map=None загружает на CPU)
+    if device == "mps":
+        print("Перемещение модели на MPS...")
+        model = model.to("mps")
+
     model.eval()
-    
     return model, tokenizer
 
-def generate_response(model, tokenizer, prompt, max_length=512, temperature=0.7, top_p=0.9, top_k=50):
+def _has_chat_template(tokenizer):
+    return hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None
+
+
+def generate_response(model, tokenizer, messages, max_new_tokens=512, temperature=0.3, top_p=0.9, top_k=50):
     """
-    Генерирует ответ модели на промпт
-    
-    Args:
-        model: модель
-        tokenizer: токенизатор
-        prompt: входной промпт
-        max_length: максимальная длина генерируемого текста
-        temperature: температура для генерации (чем выше, тем более случайно)
-        top_p: nucleus sampling параметр
-        top_k: top-k sampling параметр
+    Генерирует ответ модели.
+
+    Для instruct-моделей с chat template принимает список messages и
+    форматирует их через apply_chat_template.
+    Для legacy-моделей принимает messages[0]["content"] как плоский промпт.
     """
-    # Токенизация промпта
-    inputs = tokenizer.encode(prompt, return_tensors="pt")
-    
-    # Перемещение на устройство модели (автоматически определяется device_map)
-    # Если device_map="auto", модель сама определяет устройство
-    if hasattr(model, 'device'):
-        inputs = inputs.to(model.device)
-    elif torch.cuda.is_available():
-        inputs = inputs.to("cuda")
-    
-    # Генерация ответа
+    if _has_chat_template(tokenizer):
+        input_ids = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True,
+            return_tensors="pt", return_dict=False,
+        )
+    else:
+        prompt_parts = []
+        for msg in messages:
+            if msg["role"] == "system":
+                prompt_parts.append(f"System: {msg['content']}")
+            elif msg["role"] == "user":
+                prompt_parts.append(f"User: {msg['content']}")
+            elif msg["role"] == "assistant":
+                prompt_parts.append(f"Assistant: {msg['content']}")
+        prompt_parts.append("Assistant:")
+        prompt = "\n".join(prompt_parts)
+        input_ids = tokenizer.encode(prompt, return_tensors="pt")
+
+    device = model.device if hasattr(model, 'device') else ("cuda" if torch.cuda.is_available() else "cpu")
+    input_ids = input_ids.to(device)
+    prompt_len = input_ids.shape[1]
+
     with torch.no_grad():
         outputs = model.generate(
-            inputs,
-            max_length=max_length,
+            input_ids,
+            max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
-            repetition_penalty=1.1
+            repetition_penalty=1.1,
         )
-    
-    # Декодирование ответа
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    # Удаляем промпт из ответа, оставляем только сгенерированный текст
-    if response.startswith(prompt):
-        response = response[len(prompt):].strip()
-    
+
+    generated_ids = outputs[0][prompt_len:]
+    response = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     return response
 
-def chat_loop(model, tokenizer, system_prompt="", max_length=512, temperature=0.7):
+def chat_loop(model, tokenizer, system_prompt="", max_new_tokens=512, temperature=0.3):
     """
-    Основной цикл чата
-    
-    Args:
-        model: модель
-        tokenizer: токенизатор
-        system_prompt: системный промпт (опционально)
-        max_length: максимальная длина ответа
-        temperature: температура генерации
+    Основной цикл чата.
+    Формирует messages в формате chat template и передаёт в generate_response.
     """
+    use_chat_tpl = _has_chat_template(tokenizer)
+
     print("\n" + "="*50)
     print("Чат с моделью запущен!")
+    if use_chat_tpl:
+        print("Режим: chat template (instruct)")
+    else:
+        print("Режим: legacy prompt")
     print("Введите 'quit', 'exit' или 'q' для выхода")
     print("Введите 'clear' для очистки истории")
     print("="*50 + "\n")
-    
+
     conversation_history = []
-    
     if system_prompt:
         conversation_history.append({"role": "system", "content": system_prompt})
-    
+
     while True:
         try:
-            # Получение ввода пользователя
             user_input = input("Вы: ").strip()
-            
             if not user_input:
                 continue
-            
-            # Команды выхода
+
             if user_input.lower() in ['quit', 'exit', 'q']:
                 print("До свидания!")
                 break
-            
-            # Очистка истории
+
             if user_input.lower() == 'clear':
                 conversation_history = []
                 if system_prompt:
                     conversation_history.append({"role": "system", "content": system_prompt})
                 print("История очищена.\n")
                 continue
-            
-            # Формирование промпта из истории разговора
-            if conversation_history:
-                # Форматируем историю для модели
-                prompt_parts = []
-                for msg in conversation_history:
-                    if msg["role"] == "system":
-                        prompt_parts.append(f"System: {msg['content']}")
-                    elif msg["role"] == "user":
-                        prompt_parts.append(f"User: {msg['content']}")
-                    elif msg["role"] == "assistant":
-                        prompt_parts.append(f"Assistant: {msg['content']}")
-                
-                prompt_parts.append(f"User: {user_input}")
-                prompt_parts.append("Assistant:")
-                prompt = "\n".join(prompt_parts)
-            else:
-                prompt = f"User: {user_input}\nAssistant:"
-            
-            # Генерация ответа
+
+            messages = list(conversation_history)
+            messages.append({"role": "user", "content": user_input})
+
             print("Модель генерирует ответ...")
             response = generate_response(
-                model, 
-                tokenizer, 
-                prompt, 
-                max_length=max_length,
-                temperature=temperature
+                model,
+                tokenizer,
+                messages,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
             )
-            
-            # Вывод ответа
+
             print(f"\nМодель: {response}\n")
-            
-            # Сохранение в историю
+
             conversation_history.append({"role": "user", "content": user_input})
             conversation_history.append({"role": "assistant", "content": response})
-            
-            # Ограничение истории (оставляем последние 10 сообщений)
+
             if len(conversation_history) > 20:
                 if system_prompt:
                     conversation_history = [conversation_history[0]] + conversation_history[-19:]
                 else:
                     conversation_history = conversation_history[-20:]
-        
+
         except KeyboardInterrupt:
             print("\n\nДо свидания!")
             break
@@ -259,21 +229,19 @@ def main():
     parser.add_argument("--base_model", type=str, required=True, help="Имя базовой модели с HuggingFace")
     parser.add_argument("--lora_model", type=str, default=None, help="Путь к дообученной LoRA модели")
     parser.add_argument("--system_prompt", type=str, default="", help="Системный промпт")
-    parser.add_argument("--max_length", type=int, default=512, help="Максимальная длина ответа")
-    parser.add_argument("--temperature", type=float, default=0.7, help="Температура генерации")
-    
+    parser.add_argument("--max_new_tokens", type=int, default=512, help="Максимальное количество новых токенов")
+    parser.add_argument("--temperature", type=float, default=0.3, help="Температура генерации (рекомендуется 0.3 для Vikhr)")
+
     args = parser.parse_args()
-    
-    # Загрузка модели
+
     model, tokenizer = load_model_and_tokenizer(args.base_model, args.lora_model)
-    
-    # Запуск чата
+
     chat_loop(
-        model, 
-        tokenizer, 
+        model,
+        tokenizer,
         system_prompt=args.system_prompt,
-        max_length=args.max_length,
-        temperature=args.temperature
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
     )
 
 if __name__ == "__main__":
