@@ -1,86 +1,81 @@
-# Дообучение модели — fine_tuning/train.py
+# Обучение адаптера: fine_tuning/train.py
 
-Скрипт обучает LoRA-адаптер поверх базовой модели с HuggingFace. Поддерживает instruct-модели с chat template и модели без него.
+Скрипт обучает LoRA-адаптер поверх базовой модели с Hugging Face. Он работает и с instruct-моделями, у которых есть chat template, и с моделями без него.
 
-## Как работает
+## Что делает скрипт
 
-1. Скачивает базовую модель с HuggingFace (при первом запуске)
-2. Определяет устройство — MPS, CUDA или CPU
-3. Применяет LoRA-конфигурацию (обучается ~0.9% параметров)
-4. Форматирует датасет через chat template модели
-5. Маскирует loss на промпте — модель учится только на ответах ассистента
-6. Обучает с опциональной валидацией и логированием
-7. Сохраняет адаптер в указанную директорию
+1. При первом запуске скачивает базовую модель с Hugging Face в кеш `~/.cache/huggingface/`.
+2. Выбирает устройство. С `--device auto` порядок такой: CUDA, потом MPS, потом CPU.
+3. Подключает LoRA. Обучается около 0,9% параметров модели.
+4. Превращает каждый пример датасета в диалог через chat template модели.
+5. Считает loss только на ответах ассистента, чтобы модель училась отвечать и не заучивала промпты.
+6. Обучает, по желанию с валидацией, и пишет loss в лог.
+7. Сохраняет адаптер в папку из `--output_dir`.
 
-## Форматы датасета
+## Формат датасета
 
-Поддерживаются файлы `.json` и `.jsonl`. Скрипт автоматически определяет формат:
+Скрипт читает `.json` и `.jsonl` и сам определяет формат по полям примера.
 
-| Поля в примере | Как интерпретируется |
+| Поля в примере | Как скрипт их понимает |
 |---|---|
-| `instruction` + `input` + `output` | system=instruction, user=input, assistant=output |
-| `instruction` + `output` | user=instruction, assistant=output |
-| `prompt` + `completion` | user=prompt, assistant=completion |
-| `input` + `output` | user=input, assistant=output |
-| `text` | плоский текст |
+| `instruction` + `input` + `output` | system = instruction, user = input, assistant = output |
+| `instruction` + `output` | user = instruction, assistant = output |
+| `prompt` + `completion` | user = prompt, assistant = completion |
+| `input` + `output` | user = input, assistant = output |
+| `text` | обычный текст без ролей |
 
-Датасет проекта использует формат `instruction/input/output`:
+В датасете ретрита используется первый вариант:
 
 ```json
 {
-  "instruction": "Напиши маркетинговый текст для ретрита «Познай себя»...",
+  "instruction": "Напиши маркетинговый текст для ретрита «Познай себя» в фирменном тоне бренда...",
   "input": "Напиши текст для сторис с опросом",
-  "output": "Честный вопрос 🌿\n\nКогда ты в последний раз чувствовала себя собой?..."
+  "output": "Честный вопрос..."
 }
 ```
 
-## Параметры запуска
+## Параметры
 
-### Обязательные
+Обязательные:
 
-| Параметр | Описание |
+| Параметр | Что задает |
 |---|---|
-| `--model_name` | имя модели с HuggingFace, например `Vikhrmodels/Vikhr-Llama-3.2-1B-Instruct` |
-| `--dataset_path` | путь к тренировочному датасету `.json` или `.jsonl` |
+| `--model_name` | Имя модели на Hugging Face, например `Vikhrmodels/Vikhr-Llama-3.2-1B-Instruct` |
+| `--dataset_path` | Путь к обучающему датасету `.json` или `.jsonl` |
 
-### Часто используемые
+Обучение:
 
-| Параметр | По умолчанию | Описание |
+| Параметр | По умолчанию | Что задает |
 |---|---|---|
-| `--eval_dataset_path` | нет | валидационный датасет для отслеживания переобучения |
-| `--output_dir` | `./lora_model` | куда сохранить обученный адаптер |
-| `--num_train_epochs` | `3` | количество эпох |
-| `--per_device_train_batch_size` | `4` | размер батча |
-| `--gradient_accumulation_steps` | `4` | накопление градиента (эффективный батч = batch × steps) |
-| `--learning_rate` | `2e-4` | скорость обучения |
-| `--max_length` | `512` | максимальная длина последовательности в токенах |
-| `--device` | `auto` | `auto` / `cpu` / `cuda` / `mps` |
+| `--eval_dataset_path` | нет | Валидационный датасет, по нему видно переобучение |
+| `--output_dir` | `./lora_model` | Куда сохранить адаптер |
+| `--num_train_epochs` | `3` | Число эпох |
+| `--per_device_train_batch_size` | `4` | Размер батча |
+| `--gradient_accumulation_steps` | `4` | Накопление градиента. Эффективный батч равен батчу, умноженному на это число |
+| `--learning_rate` | `2e-4` | Скорость обучения |
+| `--max_length` | `512` | Максимальная длина примера в токенах |
+| `--device` | `auto` | `auto`, `cpu`, `cuda` или `mps` |
+| `--use_4bit` | выключено | Сжатие модели до 4 бит. Работает только на NVIDIA, на других устройствах скрипт его отключит сам |
 
-### LoRA-параметры
+LoRA:
 
-| Параметр | По умолчанию | Описание |
+| Параметр | По умолчанию | Что задает |
 |---|---|---|
-| `--lora_r` | `16` | rank адаптера — чем выше, тем больше параметров |
-| `--lora_alpha` | `32` | масштаб обновлений (обычно = 2 × r) |
-| `--lora_dropout` | `0.05` | регуляризация |
+| `--lora_r` | `16` | Ранг адаптера. Чем он выше, тем больше обучаемых параметров |
+| `--lora_alpha` | `32` | Масштаб обновлений, обычно вдвое больше ранга |
+| `--lora_dropout` | `0.05` | Регуляризация |
 
-### Шаги и логирование
+Шаги и лог:
 
-| Параметр | По умолчанию | Описание |
+| Параметр | По умолчанию | Что задает |
 |---|---|---|
-| `--save_steps` | `100` | каждые N шагов сохраняется чекпоинт |
-| `--logging_steps` | `5` | каждые N шагов выводится loss |
-| `--warmup_steps` | `20` | шаги прогрева learning rate |
-
-### Дополнительные
-
-| Параметр | Описание |
-|---|---|
-| `--use_4bit` | 4-bit квантование (только CUDA, экономит видеопамять) |
+| `--save_steps` | `100` | Чекпоинт каждые N шагов |
+| `--logging_steps` | `5` | Loss в логе каждые N шагов |
+| `--warmup_steps` | `20` | Шаги разогрева learning rate |
 
 ## Команды запуска
 
-### Apple Silicon (MPS)
+Apple Silicon (MPS):
 
 ```bash
 python fine_tuning/train.py \
@@ -96,7 +91,7 @@ python fine_tuning/train.py \
   --device auto
 ```
 
-### NVIDIA GPU
+NVIDIA с 4-битным сжатием:
 
 ```bash
 python fine_tuning/train.py \
@@ -113,7 +108,7 @@ python fine_tuning/train.py \
   --device cuda
 ```
 
-### CPU (для проверки без GPU)
+CPU, чтобы быстро проверить, что все запускается:
 
 ```bash
 python fine_tuning/train.py \
@@ -127,21 +122,15 @@ python fine_tuning/train.py \
   --device cpu
 ```
 
-## Результат
-
-После завершения в `output_dir` появятся:
+## Что получается на выходе
 
 ```text
 lora_retrit/
-├── adapter_config.json       # конфигурация LoRA
-├── adapter_model.safetensors # веса адаптера
-├── tokenizer.json            # токенизатор
+├── adapter_config.json        # настройки LoRA
+├── adapter_model.safetensors  # веса адаптера
+├── tokenizer.json             # токенизатор
 ├── tokenizer_config.json
-└── chat_template.jinja       # chat-шаблон модели
+└── chat_template.jinja        # chat template модели
 ```
 
-## Примечания
-
-- На MPS (Apple Silicon) 4-bit квантование не поддерживается — скрипт отключит его автоматически
-- Базовая модель скачивается в кеш HuggingFace (`~/.cache/huggingface/`) при первом запуске
-- `--device auto` выбирает CUDA → MPS → CPU в порядке приоритета
+Папка адаптера в `.gitignore`, в репозиторий она не входит. Подключить адаптер к чату можно через `inference/chat.py`, примеры в `inference/README.md`.
