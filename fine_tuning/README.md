@@ -1,30 +1,30 @@
-# Обучение адаптера: fine_tuning/train.py
+# Training the adapter: fine_tuning/train.py
 
-Скрипт обучает LoRA-адаптер поверх базовой модели с Hugging Face. Он работает и с instruct-моделями, у которых есть chat template, и с моделями без него.
+The script trains a LoRA adapter on top of a base model from Hugging Face. It works both with instruct models that have a chat template and with models that don't.
 
-## Что делает скрипт
+## What the script does
 
-1. При первом запуске скачивает базовую модель с Hugging Face в кеш `~/.cache/huggingface/`.
-2. Выбирает устройство. С `--device auto` порядок такой: CUDA, потом MPS, потом CPU.
-3. Подключает LoRA. Обучается около 0,9% параметров модели.
-4. Превращает каждый пример датасета в диалог через chat template модели.
-5. Считает loss только на ответах ассистента, чтобы модель училась отвечать и не заучивала промпты.
-6. Обучает, по желанию с валидацией, и пишет loss в лог.
-7. Сохраняет адаптер в папку из `--output_dir`.
+1. On first run it downloads the base model from Hugging Face into the `~/.cache/huggingface/` cache.
+2. Picks the device. With `--device auto` the order is CUDA, then MPS, then CPU.
+3. Attaches LoRA. About 0.9% of the model's parameters are trained.
+4. Turns every dataset example into a dialog through the model's chat template.
+5. Computes loss only on the assistant's answers, so the model learns to answer and doesn't memorize prompts.
+6. Trains, optionally with validation, and logs the loss.
+7. Saves the adapter to the folder given in `--output_dir`.
 
-## Формат датасета
+## Dataset format
 
-Скрипт читает `.json` и `.jsonl` и сам определяет формат по полям примера.
+The script reads `.json` and `.jsonl` and detects the format from the example's fields.
 
-| Поля в примере | Как скрипт их понимает |
+| Fields in the example | How the script reads them |
 |---|---|
 | `instruction` + `input` + `output` | system = instruction, user = input, assistant = output |
 | `instruction` + `output` | user = instruction, assistant = output |
 | `prompt` + `completion` | user = prompt, assistant = completion |
 | `input` + `output` | user = input, assistant = output |
-| `text` | обычный текст без ролей |
+| `text` | plain text with no roles |
 
-В датасете ретрита используется первый вариант:
+The retreat dataset uses the first format (the data is in Russian):
 
 ```json
 {
@@ -34,46 +34,48 @@
 }
 ```
 
-## Параметры
+In English: the instruction asks for a marketing text for the "Know Yourself" retreat in the brand's tone, the input asks for a stories text with a poll, and the output is the finished text.
 
-Обязательные:
+## Parameters
 
-| Параметр | Что задает |
+Required:
+
+| Parameter | What it sets |
 |---|---|
-| `--model_name` | Имя модели на Hugging Face, например `Vikhrmodels/Vikhr-Llama-3.2-1B-Instruct` |
-| `--dataset_path` | Путь к обучающему датасету `.json` или `.jsonl` |
+| `--model_name` | Model name on Hugging Face, for example `Vikhrmodels/Vikhr-Llama-3.2-1B-Instruct` |
+| `--dataset_path` | Path to the training dataset, `.json` or `.jsonl` |
 
-Обучение:
+Training:
 
-| Параметр | По умолчанию | Что задает |
+| Parameter | Default | What it sets |
 |---|---|---|
-| `--eval_dataset_path` | нет | Валидационный датасет, по нему видно переобучение |
-| `--output_dir` | `./lora_model` | Куда сохранить адаптер |
-| `--num_train_epochs` | `3` | Число эпох |
-| `--per_device_train_batch_size` | `4` | Размер батча |
-| `--gradient_accumulation_steps` | `4` | Накопление градиента. Эффективный батч равен батчу, умноженному на это число |
-| `--learning_rate` | `2e-4` | Скорость обучения |
-| `--max_length` | `512` | Максимальная длина примера в токенах |
-| `--device` | `auto` | `auto`, `cpu`, `cuda` или `mps` |
-| `--use_4bit` | выключено | Сжатие модели до 4 бит. Работает только на NVIDIA, на других устройствах скрипт его отключит сам |
+| `--eval_dataset_path` | none | Validation dataset; it shows overfitting |
+| `--output_dir` | `./lora_model` | Where to save the adapter |
+| `--num_train_epochs` | `3` | Number of epochs |
+| `--per_device_train_batch_size` | `4` | Batch size |
+| `--gradient_accumulation_steps` | `4` | Gradient accumulation. The effective batch is the batch size times this number |
+| `--learning_rate` | `2e-4` | Learning rate |
+| `--max_length` | `512` | Maximum example length in tokens |
+| `--device` | `auto` | `auto`, `cpu`, `cuda` or `mps` |
+| `--use_4bit` | off | 4-bit quantization. Works only on NVIDIA; on other devices the script turns it off by itself |
 
 LoRA:
 
-| Параметр | По умолчанию | Что задает |
+| Parameter | Default | What it sets |
 |---|---|---|
-| `--lora_r` | `16` | Ранг адаптера. Чем он выше, тем больше обучаемых параметров |
-| `--lora_alpha` | `32` | Масштаб обновлений, обычно вдвое больше ранга |
-| `--lora_dropout` | `0.05` | Регуляризация |
+| `--lora_r` | `16` | Adapter rank. The higher it is, the more trainable parameters |
+| `--lora_alpha` | `32` | Update scale, usually twice the rank |
+| `--lora_dropout` | `0.05` | Regularization |
 
-Шаги и лог:
+Steps and logging:
 
-| Параметр | По умолчанию | Что задает |
+| Parameter | Default | What it sets |
 |---|---|---|
-| `--save_steps` | `100` | Чекпоинт каждые N шагов |
-| `--logging_steps` | `5` | Loss в логе каждые N шагов |
-| `--warmup_steps` | `20` | Шаги разогрева learning rate |
+| `--save_steps` | `100` | A checkpoint every N steps |
+| `--logging_steps` | `5` | Loss in the log every N steps |
+| `--warmup_steps` | `20` | Learning rate warm-up steps |
 
-## Команды запуска
+## Commands
 
 Apple Silicon (MPS):
 
@@ -91,7 +93,7 @@ python fine_tuning/train.py \
   --device auto
 ```
 
-NVIDIA с 4-битным сжатием:
+NVIDIA with 4-bit quantization:
 
 ```bash
 python fine_tuning/train.py \
@@ -108,7 +110,7 @@ python fine_tuning/train.py \
   --device cuda
 ```
 
-CPU, чтобы быстро проверить, что все запускается:
+CPU, for a quick check that everything starts:
 
 ```bash
 python fine_tuning/train.py \
@@ -122,15 +124,15 @@ python fine_tuning/train.py \
   --device cpu
 ```
 
-## Что получается на выходе
+## Output
 
 ```text
 lora_retrit/
-├── adapter_config.json        # настройки LoRA
-├── adapter_model.safetensors  # веса адаптера
-├── tokenizer.json             # токенизатор
+├── adapter_config.json        # LoRA settings
+├── adapter_model.safetensors  # adapter weights
+├── tokenizer.json             # tokenizer
 ├── tokenizer_config.json
-└── chat_template.jinja        # chat template модели
+└── chat_template.jinja        # the model's chat template
 ```
 
-Папка адаптера в `.gitignore`, в репозиторий она не входит. Подключить адаптер к чату можно через `inference/chat.py`, примеры в `inference/README.md`.
+The adapter folder is in `.gitignore` and isn't part of the repository. You can attach the adapter to the chat with `inference/chat.py`; examples are in `inference/README.md`.
